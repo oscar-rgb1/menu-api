@@ -1,100 +1,89 @@
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'Content-Type',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
-};
+// netlify/functions/genera-menu.js
+export const handler = async (event, context) => {
+  const fetch = (await import("node-fetch")).default;
 
-exports.handler = async (event) => {
-  if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: corsHeaders };
+  // Configuración básica
+  const API_URL = "https://api.openai.com/v1/chat/completions";
+  const API_KEY = process.env.OPENAI_API_KEY; // Tu clave debe estar en las variables de entorno de Netlify
+  const MAX_RETRIES = 3;
+  const TIMEOUT_MS = 7000; // 7 segundos
+
+  // Parsear parámetros si vienen desde Figma Make
+  const body = event.body ? JSON.parse(event.body) : {};
+  const filtros = body.filtros || {};
+  const tipo = filtros.tipo || "normal";
+
+  // Prompt base
+  const prompt = `
+  Genera un menú semanal ${tipo === "vegano" ? "100% vegano" : tipo === "vegetariano" ? "vegetariano" : "equilibrado"}.
+  Devuelve un JSON con esta estructura:
+  {
+    "semana": [
+      {"dia": "Lunes", "plato": "Ejemplo", "tiempo_preparacion": "20 min", "dificultad": "fácil",
+      "ingredientes": [{"nombre":"ingrediente","cantidad":"100 g"}]
+      }
+    ],
+    "lista_compra": [{"nombre":"ingrediente","cantidad":"100 g"}]
   }
+  `;
 
-  const {
-    personas = 2,
-    tipo_menu = 'omnivoro',
-    dificultad = 'facil',
-    tiempo = 'cualquiera',
-    presupuesto = 'medio'
-  } = JSON.parse(event.body || '{}');
+  // Función auxiliar con reintentos y timeout
+  const fetchWithTimeout = async (url, options, retries = MAX_RETRIES) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-  const filtroDieta = {
-    vegano: '100% vegano (sin productos animales)',
-    vegetariano: 'vegetariano (sin carne ni pescado)',
-    sin_gluten: 'sin gluten (apto para celíacos)',
-    omnivoro: 'sin restricciones específicas'
-  }[tipo_menu] || 'sin restricciones específicas';
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timeout);
 
-  const filtroTiempo = {
-    rapido: '≤ 20 minutos',
-    medio: 'entre 20 y 40 minutos',
-    largo: '> 40 minutos',
-    cualquiera: 'sin límite de tiempo'
-  }[tiempo] || 'sin límite de tiempo';
-
-  const filtroDificultad = {
-    facil: 'fácil',
-    media: 'media',
-    avanzada: 'avanzada'
-  }[dificultad] || 'fácil';
-
-  const userPrompt = `
-Genera un menú semanal de 7 platos en español para ${personas} personas.
-Tipo de dieta: ${filtroDieta}.
-Tiempo de preparación: ${filtroTiempo}.
-Dificultad: ${filtroDificultad}.
-Presupuesto: ${presupuesto}.
-
-Devuelve ÚNICAMENTE JSON con esta estructura:
-{
-  "semana": [
-    {
-      "dia": "Lunes",
-      "plato": "...",
-      "tiempo_preparacion": "...",
-      "dificultad": "...",
-      "ingredientes": [
-        {"nombre": "...", "cantidad": "..."}
-      ]
+      if (!res.ok) throw new Error(`Error HTTP ${res.status}`);
+      return await res.json();
+    } catch (error) {
+      clearTimeout(timeout);
+      if (retries > 0) {
+        console.warn(`Reintentando... (${MAX_RETRIES - retries + 1})`);
+        return fetchWithTimeout(url, options, retries - 1);
+      } else {
+        console.error("Error permanente:", error.message);
+        return { error: "Fallo al generar el menú. Inténtalo de nuevo más tarde." };
+      }
     }
-  ],
-  "lista_compra": [
-    {"nombre": "...", "cantidad": "..."}
-  ]
-}
+  };
 
-Reglas:
-- Deduplica los ingredientes en "lista_compra".
-- Usa unidades claras (g, ml, ud).
-- No añadas nada fuera del JSON.
-- Cumple las restricciones del tipo de menú "${tipo_menu}".
-`;
-
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
+  // Llamada al modelo de OpenAI
+  const response = await fetchWithTimeout(API_URL, {
+    method: "POST",
     headers: {
-      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
+      "Authorization": `Bearer ${API_KEY}`,
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: 'Eres un planificador de menús semanal.' },
-        { role: 'user', content: userPrompt }
-      ],
-      response_format: { type: 'json_object' }
-    }),
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.8
+    })
   });
 
-  const data = await resp.json();
-  const content = data?.choices?.[0]?.message?.content || '{}';
+  // Validar la respuesta
+  if (response.error) {
+    return {
+      statusCode: 500,
+      body: JSON.stringify(response)
+    };
+  }
 
-  let json;
-  try { json = JSON.parse(content); }
-  catch (e) { json = { error: 'Formato JSON inválido', raw: content }; }
+  const menu = response.choices?.[0]?.message?.content || "{}";
 
-  return {
-    statusCode: 200,
-    headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    body: JSON.stringify(json),
-  };
+  try {
+    JSON.parse(menu); // validar JSON
+    return {
+      statusCode: 200,
+      body: menu
+    };
+  } catch {
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: "Respuesta no válida de la IA" })
+    };
+  }
 };
